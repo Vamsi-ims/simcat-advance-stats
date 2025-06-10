@@ -1,20 +1,16 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse
 import pandas as pd
 import json
 from bson import ObjectId
+from bson.errors import InvalidId
 from datetime import datetime
 import re
 import os
-import tempfile
+import uuid
 
 app = FastAPI()
 
-# Function to generate a random ObjectId
-def generate_object_id():
-    return str(ObjectId())
-
-# Convert time string (HH:MM:SS or MM:SS) to milliseconds
 def time_to_milliseconds(time_str):
     time_parts = list(map(int, re.split(':', time_str)))
     if len(time_parts) == 2:
@@ -26,19 +22,20 @@ def time_to_milliseconds(time_str):
         raise ValueError(f"Invalid time format: {time_str}")
     return (hours * 3600 + minutes * 60 + seconds) * 1000
 
-# Generate JSON from Excel
-def generate_json_from_excel(file_path):
+def generate_json_from_excel(file_path, test_id):
     df = pd.read_excel(file_path)
     current_date = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.%fZ')
 
-    result = [{
-        "_id": {"$oid": generate_object_id()},
-        "test_id": {"$oid": generate_object_id()},
-        "__v": 0,
-        "created_at": {"$date": current_date},
-        "updated_at": {"$date": current_date},
-        "questions": []
-    }]
+    result = [
+        {
+            "_id": {"$oid": str(ObjectId())},
+            "test_id": {"$oid": test_id},
+            "__v": 0,
+            "created_at": {"$date": current_date},
+            "updated_at": {"$date": current_date},
+            "questions": []
+        }
+    ]
 
     for _, row in df.iterrows():
         question = {
@@ -58,6 +55,7 @@ def generate_json_from_excel(file_path):
             }
         }
         result[0]["questions"].append(question)
+
     return result
 
 @app.get("/health")
@@ -65,20 +63,31 @@ def health_check():
     return {"status": "ok"}
 
 @app.post("/process")
-async def process_file(file: UploadFile = File(...)):
+async def process_excel(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    test_id: str = Form(...)
+):
     try:
-        suffix = os.path.splitext(file.filename)[-1]
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(await file.read())
-            tmp_path = tmp.name
+        ObjectId(test_id)  # Validate test_id format
+    except InvalidId:
+        raise HTTPException(status_code=400, detail="Invalid test_id format. Must be 24-character hex.")
 
-        json_data = generate_json_from_excel(tmp_path)
+    input_filename = f"temp_{uuid.uuid4().hex}.xlsx"
+    output_filename = f"output_{uuid.uuid4().hex}.json"
 
-        return JSONResponse(content=json_data)
+    with open(input_filename, "wb") as f:
+        f.write(await file.read())
 
+    try:
+        json_data = generate_json_from_excel(input_filename, test_id)
+        with open(output_filename, "w") as f:
+            json.dump(json_data, f, indent=4)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    
+        raise HTTPException(status_code=500, detail=f"Processing error: {e}")
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        os.remove(input_filename)
+
+    # Delete output file after sending it
+    background_tasks.add_task(os.remove, output_filename)
+    return FileResponse(output_filename, media_type="application/json", filename="result.json")
